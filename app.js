@@ -110,6 +110,7 @@ async function dbClearCases() {
 // ─── 快取狀態 ────────────────────────────────────────────────
 let cachedSpec = null;  // { filename, text, savedAt }
 let useCache   = false; // 是否以快取作為舊版比對
+let analysisMode = 'spec'; // spec | baseline
 
 function showCacheNotice(spec) {
   cachedSpec = spec;
@@ -251,6 +252,28 @@ const PROMPT_DIFF = (newSpecText, oldSpecText) => `你是一位擁有 10 年經�
     - "影響層級": [P0, P1, P2] 三選一，不附加任何括號說明文字
     - "編號": 類型縮寫_類別縮寫_序號（如 POS_ROOM_001）
     - "版本標籤": "${getTodayStr()}_v1"`;
+
+const PROMPT_BASELINE_DIFF = (newSpecText, baselineCasesJson) => `你是一位資深遊戲 QA 測試專家。請根據【新版規格書】與【既有 TestCase 清單】做覆蓋比對，輸出可直接執行的測試案例結果。
+
+【新版規格書】：
+${newSpecText}
+
+【既有 TestCase 清單】：
+${baselineCasesJson}
+
+### 任務要求
+1. 保留仍然有效的案例（狀態填「有效」）。
+2. 對已不適用的案例標記為「失效」，並盡量在「取代者」填入新版對應案例編號，若無則填空字串。
+3. 對規則或數值改動造成需重寫的案例，輸出新版可執行案例，狀態填「有效」。
+4. 對新版新增功能，補上新案例，狀態填「有效」。
+5. 以「編號」作為識別。若無法沿用舊編號，可產生新編號。
+
+### 輸出規範（僅回傳 JSON 陣列）
+- 每個物件必須包含下列欄位（不可省略，請依此順序）：  
+  "狀態","取代者","測試類型","類別","前置條件","功能模組","規格來源","測試標題","預期結果","影響層級","編號","版本標籤"
+- 若某欄無內容，請填「—」。
+- 僅允許上述欄位，禁止輸出其他 key。
+- 不要輸出 Markdown，不要輸出說明文字。`;
 
 // ─── Prompt：驗證舊案例有效性 ────────────────────────────────
 const PROMPT_OBSOLETE = (newSpecText, caseSummaryJson, newCaseSummaryJson) =>
@@ -415,6 +438,8 @@ function parseAiJson(rawText) {
     const srcSuspicious = rawSrc.trim() !== '' && /^\d+\.[a-zA-Z]$/.test(rawSrc.trim());
 
     return {
+      '狀態':        entry['狀態'] || '',
+      '取代者':      entry['取代者'] || '',
       '測試類型':    entry['測試類型'] || '',
       '類別':        entry['類別']     || '',
       '前置條件':    entry['前置條件'] || '',
@@ -428,6 +453,127 @@ function parseAiJson(rawText) {
       '版本標籤':    entry['版本標籤'] || entry['版本'] || entry['version'] || ''
     };
   });
+}
+
+function normalizeCaseId(id) {
+  const s = (id || '').trim();
+  if (!s) return '';
+  const m = s.match(/([A-Z]{3}_[A-Z]{3,6}_\d{3,})$/);
+  return m ? m[1] : s;
+}
+
+function sanitizeImportedCase(entry) {
+  return {
+    '狀態': entry['狀態'] || '有效',
+    '取代者': entry['取代者'] || '',
+    '測試類型': entry['測試類型'] || '',
+    '類別': entry['類別'] || '',
+    '前置條件': entry['前置條件'] || '',
+    '功能模組': entry['功能模組'] || '',
+    '規格來源': entry['規格來源'] || '',
+    '測試標題': entry['測試標題'] || '',
+    '預期結果': entry['預期結果'] || '',
+    '影響層級': entry['影響層級'] || '',
+    '編號': entry['編號'] || '',
+    '版本標籤': entry['版本標籤'] || ''
+  };
+}
+
+function dedupeCasesWithObsoleteMark(cases) {
+  const byBaseId = new Map();
+  cases.forEach((c, idx) => {
+    const base = normalizeCaseId(c['編號']) || `__idx_${idx}`;
+    if (!byBaseId.has(base)) byBaseId.set(base, []);
+    byBaseId.get(base).push(c);
+  });
+
+  const result = [];
+  byBaseId.forEach(list => {
+    if (list.length === 1) {
+      result.push(list[0]);
+      return;
+    }
+    // 保留最新（最後一筆）
+    for (let i = 0; i < list.length - 1; i++) {
+      result.push({ ...list[i], _obsolete: true, _replacedBy: list[list.length - 1]['編號'] || null });
+    }
+    result.push(list[list.length - 1]);
+  });
+  return result;
+}
+
+function parseCsvLine(line) {
+  const out = [];
+  let cur = '';
+  let q = false;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (ch === '"') {
+      if (q && line[i + 1] === '"') { cur += '"'; i++; }
+      else q = !q;
+    } else if (ch === ',' && !q) {
+      out.push(cur.trim());
+      cur = '';
+    } else {
+      cur += ch;
+    }
+  }
+  out.push(cur.trim());
+  return out;
+}
+
+function normalizeHeaderName(name) {
+  return (name || '')
+    .toString()
+    .replace(/^\uFEFF/, '')   // BOM
+    .replace(/\r|\n/g, '')    // 換行
+    .replace(/\u3000/g, ' ')  // 全形空白
+    .trim();
+}
+
+async function loadBaselineCasesFromFile(file) {
+  const required = ['編號', '測試類型', '類別', '影響層級', '功能模組', '前置條件', '測試標題', '預期結果', '規格來源', '版本標籤'];
+  const requiredNorm = required.map(normalizeHeaderName);
+  let rows = [];
+  let sourceHeaders = [];
+
+  if (file.name.toLowerCase().endsWith('.csv')) {
+    const text = await file.text();
+    const lines = text.split(/\r?\n/).filter(l => l.trim() !== '');
+    if (lines.length < 2) throw new Error('CSV 內容不足，至少需要標題列與 1 筆資料');
+    const headers = parseCsvLine(lines[0]).map(normalizeHeaderName);
+    sourceHeaders = headers;
+    rows = lines.slice(1).map(line => {
+      const cols = parseCsvLine(line);
+      const obj = {};
+      headers.forEach((h, i) => { obj[h] = cols[i] || ''; });
+      return obj;
+    });
+  } else if (file.name.toLowerCase().endsWith('.xlsx')) {
+    const wb = new ExcelJS.Workbook();
+    const buf = await file.arrayBuffer();
+    await wb.xlsx.load(buf);
+    const ws = wb.worksheets[0];
+    if (!ws) throw new Error('XLSX 讀取失敗：找不到工作表');
+    const headerRow = ws.getRow(1).values.slice(1).map(v => normalizeHeaderName(v || ''));
+    sourceHeaders = headerRow;
+    rows = [];
+    ws.eachRow((row, idx) => {
+      if (idx === 1) return;
+      const vals = row.values.slice(1);
+      const obj = {};
+      headerRow.forEach((h, i) => { obj[h] = (vals[i] || '').toString().trim(); });
+      rows.push(obj);
+    });
+    rows = rows.filter(r => Object.values(r).some(v => (v || '').trim() !== ''));
+  } else {
+    throw new Error('Baseline 檔案僅支援 CSV 或 XLSX');
+  }
+
+  const sourceSet = new Set(sourceHeaders.map(normalizeHeaderName));
+  const missing = required.filter((k, i) => !sourceSet.has(requiredNorm[i]));
+  if (missing.length > 0) throw new Error(`Baseline 缺少必要欄位：${missing.join('、')}`);
+  return rows.map(sanitizeImportedCase);
 }
 
 // ─── UI 狀態管理 ─────────────────────────────────────────────
@@ -513,16 +659,16 @@ function renderTable(cases, allCases) {
     if (missingFields.length > 0) {
       emptyDetails.push({ id: c['編號'] || '(無編號)', fields: missingFields });
     }
-    if (c['_obsolete']) obsoleteCount++;
+    if (c['_obsolete'] || c['狀態'] === '失效') obsoleteCount++;
   });
 
   // 渲染列（filtered+sorted cases）
   cases.forEach(c => {
-    const isObsolete = !!c['_obsolete'];
+    const isObsolete = !!c['_obsolete'] || c['狀態'] === '失效';
 
     const repCell = isObsolete
-      ? (c['_replacedBy']
-          ? `<td class="col-rep"><span class="case-link" onclick="scrollToCase('${c['_replacedBy']}')">${c['_replacedBy']}</span></td>`
+      ? ((c['_replacedBy'] || c['取代者'])
+          ? `<td class="col-rep"><span class="case-link" onclick="scrollToCase('${c['_replacedBy'] || c['取代者']}')">${c['_replacedBy'] || c['取代者']}</span></td>`
           : `<td class="col-rep" style="color:var(--muted);font-size:11px;">已廢除</td>`)
       : `<td class="col-rep"></td>`;
 
@@ -807,10 +953,10 @@ async function downloadXLSX(cases) {
   const ORANGE = 'FFFF8C00';
 
   cases.forEach(c => {
-    const isObsolete = !!c['_obsolete'];
+    const isObsolete = !!c['_obsolete'] || c['狀態'] === '失效';
     const row = ws.addRow({
-      status:    isObsolete ? '已失效（僅供參考）' : '有效',
-      replacedBy: c['_replacedBy'] || '',
+      status:    isObsolete ? '已失效（僅供參考）' : (c['狀態'] || '有效'),
+      replacedBy: c['_replacedBy'] || c['取代者'] || '',
       id:        c['編號']   || '',
       type:      c['測試類型'] || '',
       cat:       c['類別']   || '',
@@ -874,9 +1020,11 @@ async function runAnalysis() {
   const apiKey  = document.getElementById('apiKeyInput').value.trim();
   const newFile = document.getElementById('newFile').files[0];
   const oldFile = document.getElementById('oldFile').files[0];
+  const baselineFile = document.getElementById('baselineFile')?.files?.[0];
 
   if (!apiKey)  { showError('請填入 Gemini API Key'); return; }
   if (!newFile) { showError('請上傳新版規格書 PDF'); return; }
+  if (analysisMode === 'baseline' && !baselineFile) { showError('請上傳 Baseline TestCase（CSV/XLSX）'); return; }
 
   // ── 若已有結果，詢問附加或清空 ──────────────────────────────
   let appendMode = false;
@@ -904,21 +1052,25 @@ async function runAnalysis() {
     // 決定舊版文字來源：上傳的檔案 > 快取 > 無
     let oldText     = null;
     let oldLabel    = '';
-    if (oldFile) {
+    if (analysisMode === 'spec' && oldFile) {
       oldText  = await extractPdfText(oldFile);
       oldLabel = oldFile.name;
-    } else if (useCache && cachedSpec) {
+    } else if (analysisMode === 'spec' && useCache && cachedSpec) {
       oldText  = cachedSpec.text;
       oldLabel = `${cachedSpec.filename}（快取）`;
     }
 
     setStep(1, 'done');
     document.getElementById('step1Text').textContent =
-      `PDF 解析完成（新版 ${newFile.name}${oldText ? '，舊版 ' + oldLabel : ''}）`;
+      analysisMode === 'baseline'
+        ? `PDF 解析完成（新版 ${newFile.name}）`
+        : `PDF 解析完成（新版 ${newFile.name}${oldText ? '，舊版 ' + oldLabel : ''}）`;
 
     // Step 2：呼叫 Gemini AI（含進度條）
     setStep(2, 'running');
-    const mode = oldText ? '差異比對模式' : '全量產出模式';
+    const mode = analysisMode === 'baseline'
+      ? '匯入Case比對模式'
+      : (oldText ? '差異比對模式' : '全量產出模式');
     document.getElementById('step2Text').textContent = `呼叫 Gemini AI（${mode}）...`;
 
     // 啟動假進度條
@@ -941,7 +1093,25 @@ async function runAnalysis() {
 
     let rawText;
     try {
-      const prompt = oldText ? buildDiffPrompt(newText, oldText) : buildFullPrompt(newText);
+      let prompt;
+      if (analysisMode === 'baseline') {
+        const baselineCases = await loadBaselineCasesFromFile(baselineFile);
+        const baselineSummary = baselineCases.map(c => ({
+          編號: c['編號'],
+          測試類型: c['測試類型'],
+          類別: c['類別'],
+          影響層級: c['影響層級'],
+          功能模組: c['功能模組'],
+          前置條件: c['前置條件'],
+          測試標題: c['測試標題'],
+          預期結果: c['預期結果'],
+          規格來源: c['規格來源'],
+          版本標籤: c['版本標籤']
+        }));
+        prompt = buildBaselinePrompt(newText, JSON.stringify(baselineSummary, null, 2));
+      } else {
+        prompt = oldText ? buildDiffPrompt(newText, oldText) : buildFullPrompt(newText);
+      }
       rawText = await callGemini(apiKey, prompt);
     } finally {
       clearInterval(progressTimer);
@@ -958,11 +1128,15 @@ async function runAnalysis() {
     setStep(3, 'running');
     document.getElementById('step3Text').textContent = `處理並格式化結果...`;
 
-    const rawCases     = parseAiJson(rawText);
+    const rawCases = parseAiJson(rawText).map(c => ({
+      ...c,
+      '狀態': c['狀態'] || '有效',
+      '取代者': c['取代者'] || ''
+    }));
     const versionPrefix = document.getElementById('verPrefixInput').value.trim();
 
     // 差異比對 + 附加模式 + 有前綴 → 新案例編號加前綴
-    const newCases = (versionPrefix && oldText && appendMode)
+    const newCases = (versionPrefix && oldText && appendMode && analysisMode === 'spec')
       ? rawCases.map(c => ({ ...c, '編號': c['編號'] ? `${versionPrefix}_${c['編號']}` : c['編號'] }))
       : rawCases;
 
@@ -970,6 +1144,9 @@ async function runAnalysis() {
       currentCases = [...currentCases, ...newCases];
     } else {
       currentCases = newCases;
+    }
+    if (analysisMode === 'baseline') {
+      currentCases = dedupeCasesWithObsoleteMark(currentCases);
     }
 
     setStep(3, 'done');
@@ -982,7 +1159,7 @@ async function runAnalysis() {
     document.getElementById('resultSection').classList.add('visible');
 
     // ── Step V：附加模式 + 有舊版規格 → 驗證既有案例有效性 ──────
-    if (appendMode && oldText) {
+    if (analysisMode === 'spec' && appendMode && oldText) {
       const casesBeforeAppend = currentCases.slice(0, currentCases.length - newCases.length);
       if (casesBeforeAppend.length > 0) {
         const obsoleteList = await runObsoleteCheck(apiKey, newText, casesBeforeAppend, newCases);
@@ -1042,14 +1219,14 @@ document.getElementById('toggleKeyBtn').addEventListener('click', () => {
 });
 
 // ─── 檔案上傳 UI ─────────────────────────────────────────────
-function setupFileZone(fileInputId, zoneId, fileNameId) {
+function setupFileZone(fileInputId, zoneId, fileNameId, validator) {
   const input = document.getElementById(fileInputId);
   const zone  = document.getElementById(zoneId);
   const label = document.getElementById(fileNameId);
 
   input.addEventListener('change', () => {
     const file = input.files[0];
-    if (file) {
+    if (file && (!validator || validator(file))) {
       label.textContent = `📎 ${file.name}`;
       zone.classList.add('has-file');
       // 上傳檔案到舊版區時，取消快取模式
@@ -1064,7 +1241,7 @@ function setupFileZone(fileInputId, zoneId, fileNameId) {
     e.preventDefault();
     zone.classList.remove('drag-over');
     const file = e.dataTransfer.files[0];
-    if (file && file.type === 'application/pdf') {
+    if (file && (!validator || validator(file))) {
       const dt = new DataTransfer();
       dt.items.add(file);
       input.files = dt.files;
@@ -1078,6 +1255,7 @@ function setupFileZone(fileInputId, zoneId, fileNameId) {
 
 // ─── 版本前綴輔助 ────────────────────────────────────────────
 function hasOldSpec() {
+  if (analysisMode === 'baseline') return false;
   return document.getElementById('oldFile').files.length > 0 || (useCache && !!cachedSpec);
 }
 
@@ -1121,14 +1299,19 @@ function updatePrefixUI() {
 function checkReady() {
   const hasApiKey  = document.getElementById('apiKeyInput').value.trim().length > 0;
   const hasNewFile = document.getElementById('newFile').files.length > 0;
+  const hasBaseline = document.getElementById('baselineFile')?.files.length > 0;
   const required   = isPrefixRequired();
   const hasPrefix  = document.getElementById('verPrefixInput').value.trim().length > 0;
-  document.getElementById('analyzeBtn').disabled = !(hasApiKey && hasNewFile && (!required || hasPrefix));
+  const modeReady = analysisMode === 'baseline'
+    ? (hasApiKey && hasNewFile && hasBaseline)
+    : (hasApiKey && hasNewFile && (!required || hasPrefix));
+  document.getElementById('analyzeBtn').disabled = !modeReady;
   updatePrefixUI();
 }
 
 document.getElementById('apiKeyInput').addEventListener('input', checkReady);
 document.getElementById('verPrefixInput').addEventListener('input', checkReady);
+document.getElementById('baselineFile')?.addEventListener('change', checkReady);
 
 // ─── API Key 說明展開/收合 ────────────────────────────────────
 document.getElementById('helpKeyBtn').addEventListener('click', () => {
@@ -1140,6 +1323,45 @@ document.getElementById('helpKeyBtn').addEventListener('click', () => {
 
 setupFileZone('newFile', 'newZone', 'newFileName');
 setupFileZone('oldFile', 'oldZone', 'oldFileName');
+setupFileZone(
+  'baselineFile',
+  'baselineZone',
+  'baselineFileName',
+  f => /\.csv$/i.test(f.name) || /\.xlsx$/i.test(f.name)
+);
+
+function setAnalysisMode(mode) {
+  analysisMode = mode;
+  const specBtn = document.getElementById('modeSpecBtn');
+  const baseBtn = document.getElementById('modeBaselineBtn');
+  const baselineWrap = document.getElementById('baselineWrap');
+  const oldZone = document.getElementById('oldZone')?.parentElement;
+  const cacheNotice = document.getElementById('cacheNotice');
+  const promptCard = document.querySelector('.right-col');
+
+  if (mode === 'baseline') {
+    specBtn.classList.remove('active');
+    baseBtn.classList.add('active');
+    baselineWrap.style.display = '';
+    if (oldZone) oldZone.style.display = 'none';
+    if (cacheNotice) cacheNotice.style.display = 'none';
+    if (promptCard) promptCard.style.opacity = '';
+    document.getElementById('verPrefixRow').style.display = 'none';
+    activatePromptTab('baseline');
+  } else {
+    specBtn.classList.add('active');
+    baseBtn.classList.remove('active');
+    baselineWrap.style.display = 'none';
+    if (oldZone) oldZone.style.display = '';
+    if (cacheNotice && cachedSpec) cacheNotice.style.display = '';
+    if (promptCard) promptCard.style.opacity = '';
+    activatePromptTab('diff');
+  }
+  checkReady();
+}
+
+document.getElementById('modeSpecBtn').addEventListener('click', () => setAnalysisMode('spec'));
+document.getElementById('modeBaselineBtn').addEventListener('click', () => setAnalysisMode('baseline'));
 
 document.getElementById('analyzeBtn').addEventListener('click', runAnalysis);
 
@@ -1222,6 +1444,9 @@ function getDefaultFullTemplate() {
 function getDefaultDiffTemplate() {
   return PROMPT_DIFF('{{NEW_SPEC}}', '{{OLD_SPEC}}');
 }
+function getDefaultBaselineTemplate() {
+  return PROMPT_BASELINE_DIFF('{{NEW_SPEC}}', '{{BASELINE_CASES}}');
+}
 
 function buildFullPrompt(newText) {
   const tpl = document.getElementById('promptFullTA').value;
@@ -1232,33 +1457,48 @@ function buildDiffPrompt(newText, oldText) {
     .replace('{{NEW_SPEC}}', newText)
     .replace('{{OLD_SPEC}}', oldText);
 }
+function buildBaselinePrompt(newText, baselineCasesJson) {
+  return document.getElementById('promptBaselineTA').value
+    .replace('{{NEW_SPEC}}', newText)
+    .replace('{{BASELINE_CASES}}', baselineCasesJson);
+}
 
 function initPromptTextareas() {
   document.getElementById('promptFullTA').value = getDefaultFullTemplate();
   document.getElementById('promptDiffTA').value = getDefaultDiffTemplate();
+  document.getElementById('promptBaselineTA').value = getDefaultBaselineTemplate();
+}
+
+function activatePromptTab(tab) {
+  const tabs = {
+    full: document.getElementById('tabFull'),
+    diff: document.getElementById('tabDiff'),
+    baseline: document.getElementById('tabBaseline')
+  };
+  const areas = {
+    full: document.getElementById('promptFullTA'),
+    diff: document.getElementById('promptDiffTA'),
+    baseline: document.getElementById('promptBaselineTA')
+  };
+  Object.keys(tabs).forEach(k => {
+    tabs[k].classList.toggle('active', k === tab);
+    areas[k].style.display = (k === tab) ? '' : 'none';
+  });
 }
 
 // Tab 切換
-document.getElementById('tabFull').addEventListener('click', () => {
-  document.getElementById('tabFull').classList.add('active');
-  document.getElementById('tabDiff').classList.remove('active');
-  document.getElementById('promptFullTA').style.display = '';
-  document.getElementById('promptDiffTA').style.display = 'none';
-});
-document.getElementById('tabDiff').addEventListener('click', () => {
-  document.getElementById('tabDiff').classList.add('active');
-  document.getElementById('tabFull').classList.remove('active');
-  document.getElementById('promptDiffTA').style.display = '';
-  document.getElementById('promptFullTA').style.display = 'none';
-});
+document.getElementById('tabFull').addEventListener('click', () => activatePromptTab('full'));
+document.getElementById('tabDiff').addEventListener('click', () => activatePromptTab('diff'));
+document.getElementById('tabBaseline').addEventListener('click', () => activatePromptTab('baseline'));
 
 // 重置為預設
 document.getElementById('resetPromptBtn').addEventListener('click', () => {
-  const isFullActive = document.getElementById('tabFull').classList.contains('active');
-  if (isFullActive) {
+  if (document.getElementById('tabFull').classList.contains('active')) {
     document.getElementById('promptFullTA').value = getDefaultFullTemplate();
-  } else {
+  } else if (document.getElementById('tabDiff').classList.contains('active')) {
     document.getElementById('promptDiffTA').value = getDefaultDiffTemplate();
+  } else {
+    document.getElementById('promptBaselineTA').value = getDefaultBaselineTemplate();
   }
 });
 

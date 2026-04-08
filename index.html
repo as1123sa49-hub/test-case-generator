@@ -76,6 +76,23 @@
     .btn-large { padding: 12px 32px; font-size: 15px; }
 
     .upload-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+    .mode-switch {
+      display: flex; gap: 8px; margin-bottom: 14px; flex-wrap: wrap;
+    }
+    .mode-chip {
+      border: 1px solid var(--border);
+      background: var(--surface2);
+      color: var(--text);
+      border-radius: 999px;
+      padding: 6px 12px;
+      font-size: 12px;
+      cursor: pointer;
+    }
+    .mode-chip.active {
+      border-color: var(--blue);
+      color: var(--blue);
+      background: rgba(116,192,252,.12);
+    }
 
     .upload-zone {
       border: 2px dashed var(--border); border-radius: 8px;
@@ -430,6 +447,10 @@
           <span>📄 上傳規格書</span>
           <span class="badge">Step 2</span>
         </div>
+      <div class="mode-switch">
+        <button class="mode-chip active" id="modeSpecBtn">新舊規格比對</button>
+        <button class="mode-chip" id="modeBaselineBtn">匯入Case比對新版</button>
+      </div>
         <div class="upload-grid">
 
           <div>
@@ -471,6 +492,17 @@
             </div>
           </div>
 
+          <div id="baselineWrap" style="display:none;">
+            <div style="font-size:11px;color:var(--muted);font-weight:600;text-transform:uppercase;letter-spacing:.5px;margin-bottom:8px;">Baseline TestCase（必填）</div>
+            <div class="upload-zone" id="baselineZone">
+              <input type="file" id="baselineFile" accept=".csv,.xlsx" />
+              <div class="upload-icon">🧾</div>
+              <div class="upload-label">拖曳或點擊上傳</div>
+              <div class="upload-sub">匯入既有 TestCase（CSV / XLSX）</div>
+              <div class="upload-filename" id="baselineFileName"></div>
+            </div>
+          </div>
+
         </div>
 
         <!-- 版本前綴（差異比對 + 已有案例時必填）-->
@@ -503,13 +535,15 @@
         <div class="prompt-tabs">
           <button class="prompt-tab active" id="tabFull">全量產出模式</button>
           <button class="prompt-tab" id="tabDiff">差異比對模式</button>
+          <button class="prompt-tab" id="tabBaseline">匯入Case比對模式</button>
         </div>
         <textarea id="promptFullTA" class="prompt-textarea" spellcheck="false"></textarea>
         <textarea id="promptDiffTA" class="prompt-textarea" spellcheck="false" style="display:none;"></textarea>
+        <textarea id="promptBaselineTA" class="prompt-textarea" spellcheck="false" style="display:none;"></textarea>
         <div class="prompt-footer">
           <div>
             <div class="prompt-hint">💡 提示詞可自由編輯，修改後立即生效</div>
-            <div class="prompt-hint" style="margin-top:3px;">⚠️ 請勿刪除 {{SPEC}} 標記，這是規格書的插入位置</div>
+            <div class="prompt-hint" style="margin-top:3px;">⚠️ 請勿刪除模板標記（如 {{SPEC}} / {{NEW_SPEC}} / {{OLD_SPEC}} / {{BASELINE_CASES}}）</div>
           </div>
           <button class="btn-secondary" style="padding:5px 14px;font-size:12px;" id="resetPromptBtn">🔄 重置為預設</button>
         </div>
